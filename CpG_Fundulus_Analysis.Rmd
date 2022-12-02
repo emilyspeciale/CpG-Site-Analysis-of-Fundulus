@@ -1,0 +1,418 @@
+---
+title: "CpG_Analysis"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## Introduction
+
+The purpose of this code is to determine status of methylation within three genomic regions of Fundulus heteroclitus (exons, 5' UTR, and 3' UTR) by calculating CpG O/E ratios and GC content of genes within each region, and using it to identify CpG islands (CGIs). CGIs are defined as having a CpG O/E ratio > 0.6, a GC content > 50%, and a length > 200 base pairs. They are considered hypomethylated and evolutionary conserved areas of the genome, making them of importance to identify. 
+
+## Exons
+
+```{r importing data and calculations}
+# install and read in Biostrings
+BiocManager::install("Biostrings")
+library("Biostrings")
+# use Biostrings to read in exon IDs and sequences
+exons <- readDNAStringSet("exon_export.txt")
+# find frequencies of Cs, Gs, CGs, and CGs
+exon.sequences <- data.frame(Ensembl_Gene_ID = names(exons),Sequence = exons, dinucleotideFrequency(exons), oligonucleotideFrequency(exons, width=1))
+library(dplyr)
+exon.sequences <- select(exon.sequences, Ensembl_Gene_ID, Sequence, C, G, CG, GC)
+# delete rows where C or G is 0
+exon.sequences <- subset(exon.sequences, C != 0)
+exon.sequences <- subset(exon.sequences, G != 0)
+# find length of each sequence
+exon.sequences$L <- nchar(exon.sequences$Sequence)
+# add together Gs and Cs to get % gc content
+exon.sequences$GC_Content <- ((exon.sequences$C + exon.sequences$G) / (exon.sequences$L)) * 100
+# calculate CpG ratio based on this definition
+# https://bmcgenomics.biomedcentral.com/articles/10.1186/1471-2164-11-483
+exon.sequences$A <- exon.sequences$CG / (exon.sequences$C * exon.sequences$G)
+exon.sequences$B <- (exon.sequences$L)^2 / (exon.sequences$L - 1)
+exon.sequences$CpG_Ratio <- exon.sequences$A * exon.sequences$B
+# filter list to just gene ID and ratio
+exon.data <- select(exon.sequences, Ensembl_Gene_ID, CpG_Ratio, GC_Content, L)
+```
+
+```{r creating attribute table with gene ontology descriptions }
+# Load ViSEAGO package from Bioconductor.
+BiocManager::install("ViSEAGO")
+# Install biomaRt.
+BiocManager::install("biomaRt")
+library(biomaRt)
+ensembl <- useMart("ensembl")
+# Make a biomaRt for Fundulus heteroclitus.
+ensembl <- useMart("ensembl", dataset="fheteroclitus_gene_ensembl")
+# Load in the different filters you can apply to a query.
+filters <- listFilters(ensembl)
+# Load in the different attributes you can grab from biomaRt.
+attributes <- listAttributes(ensembl)
+# Use the attributes to create a list with Gene ID, GO ID, transcript length, domain, term name, gene description, and percent GC content
+exon.list <- getBM(attributes=c('ensembl_gene_id', 'go_id','transcript_length', 'namespace_1003', 'name_1006', 'description', 'percentage_gene_gc_content'),
+                   values = exon.data, 
+                   mart = ensembl)
+# Delete rows with no GO ID. 
+exon.list <- subset(exon.list, exon.list$go_id!="")
+# Rename the columns of this list. 
+names(exon.list)[names(exon.list) == "ensembl_gene_id"] <- "Ensembl_Gene_ID"
+names(exon.list)[names(exon.list) == "go_id"] <- "GO_ID"
+names(exon.list)[names(exon.list) == "transcript_length"] <- "Transcript_Length"
+names(exon.list)[names(exon.list) == "namespace_1003"] <- "GO_Domain"
+names(exon.list)[names(exon.list) == "name_1006"] <- "GO_Term_Name"
+names(exon.list)[names(exon.list) == "description"] <- "Gene_Description"
+names(exon.list)[names(exon.list) == "percentage_gene_gc_content"] <- "Percent_GC_Content"
+```
+
+```{r merging data frames, filtering for CGIs, and statistics}
+# In order to add the CpG O/E ratios to our list, merge the exon list with our data list.  
+exon.cpg <- left_join(exon.data, exon.list, by = "Ensembl_Gene_ID")
+# filter so there are no duplicate gene descriptions
+exon.cpg <- exon.cpg[!duplicated(exon.cpg$Gene_Description),]
+# filter so there are only rows with GC content
+exon.cpg <- exon.cpg[!is.na(exon.cpg$Percent_GC_Content), ]
+# mean and SD for cpg ratio and gc content
+mean(exon.cpg$CpG_Ratio)
+sd(exon.cpg$CpG_Ratio)
+mean(exon.cpg$GC_Content)
+sd(exon.cpg$GC_Content)
+# create list with only CpG islands
+exon.cpg.island <- filter(exon.cpg, GC_Content > 50, CpG_Ratio > 0.6, L > 199)
+# mean and SD for cpg island ratio and gc content
+mean(exon.cpg.island$CpG_Ratio)
+sd(exon.cpg.island$CpG_Ratio)
+mean(exon.cpg.island$GC_Content)
+sd(exon.cpg.island$GC_Content)
+```
+
+```{r writing tables for Cytoscape BiNGO analysis}
+# Now we are ready use Cytoscape BiNGO to determine significance of our CpG islands. First create a reference list from all the genes. Upon creating the text file, edit the first line to this: (species=/Users/emilyspeciale/Desktop/exon_cytoscape.txt)(type=Biological Process)(curator=GO)
+exon.cytoscape <- getBM(attributes=c('ensembl_gene_id', 'go_id'),
+                        values = exon.cpg, 
+                        mart = ensembl
+)
+exon.cytoscape$go_id <- gsub("GO:","",as.character(exon.cytoscape$go_id))
+exon.cytoscape <- subset(exon.cytoscape, exon.cytoscape$go_id!="")
+write.table(exon.cytoscape, file = 'exon_cytoscape.txt', sep=" = ",
+            row.names = FALSE,
+            quote = FALSE)
+# Now make a table with our CpG island data that we can put into Cytoscape BiNGO and test against the reference list.
+exon.cpg.cyto <- dplyr::select(exon.cpg.island, Ensembl_Gene_ID)
+write.table(exon.cpg.cyto, file = "exon_cpg_cyto.txt", sep=" = ",
+            row.names = FALSE,
+            quote = FALSE)
+```
+
+
+## 5' UTR
+
+```{r importing data and calculations}
+# install and read in Biostrings
+BiocManager::install("Biostrings")
+library("Biostrings")
+# use Biostrings to read in exon IDs and sequences
+five <- readDNAStringSet("five_export.txt")
+# find frequencies of Cs, Gs, CGs, and CGs
+five.sequences <- data.frame(Ensembl_Gene_ID = names(five),Sequence = five, dinucleotideFrequency(five), oligonucleotideFrequency(five, width=1))
+five.sequences <- dplyr::select(five.sequences, Ensembl_Gene_ID, Sequence, C, G, CG, GC)
+# delete rows where sequence unavailable
+five.sequences <- subset(five.sequences, Sequence != "SNCNAVAAB")
+# delete rows where C or G is 0
+five.sequences <- subset(five.sequences, C != 0)
+five.sequences <- subset(five.sequences, G != 0)
+# find length of each sequence
+five.sequences$L <- nchar(five.sequences$Sequence)
+# add together Gs and Cs to get % gc content
+five.sequences$GC_Content <- ((five.sequences$C + five.sequences$G) / (five.sequences$L)) * 100
+# calculate CpG ratio based on this definition
+# https://bmcgenomics.biomedcentral.com/articles/10.1186/1471-2164-11-483
+five.sequences$A <- five.sequences$CG / (five.sequences$C * five.sequences$G)
+five.sequences$B <- (five.sequences$L)^2 / (five.sequences$L - 1)
+five.sequences$CpG_Ratio <- five.sequences$A * five.sequences$B
+# filter list to just gene ID and ratio
+five.data <- dplyr::select(five.sequences, Ensembl_Gene_ID, CpG_Ratio, GC_Content, L)
+```
+
+```{r creating attribute table with gene ontology descriptions }
+# Load ViSEAGO package from Bioconductor.
+BiocManager::install("ViSEAGO")
+# Install biomaRt.
+BiocManager::install("biomaRt")
+library(biomaRt)
+ensembl <- useMart("ensembl")
+# Make a biomaRt for Fundulus heteroclitus.
+ensembl <- useMart("ensembl", dataset="fheteroclitus_gene_ensembl")
+# Load in the different filters you can apply to a query.
+filters <- listFilters(ensembl)
+# Load in the different attributes you can grab from biomaRt.
+attributes <- listAttributes(ensembl)
+# Use the attributes to create a list with Gene ID, GO ID, transcript length, domain, term name, gene description, and percent GC content
+five.list <- getBM(attributes=c('ensembl_gene_id', 'go_id','transcript_length', 'namespace_1003', 'name_1006', 'description', 'percentage_gene_gc_content'),
+                   values = five.data, 
+                   mart = ensembl)
+# Delete rows with no GO ID. 
+five.list <- subset(five.list, five.list$go_id!="")
+# Rename the columns of this list. 
+names(five.list)[names(five.list) == "ensembl_gene_id"] <- "Ensembl_Gene_ID"
+names(five.list)[names(five.list) == "go_id"] <- "GO_ID"
+names(five.list)[names(five.list) == "transcript_length"] <- "Transcript_Length"
+names(five.list)[names(five.list) == "namespace_1003"] <- "GO_Domain"
+names(five.list)[names(five.list) == "name_1006"] <- "GO_Term_Name"
+names(five.list)[names(five.list) == "description"] <- "Gene_Description"
+names(five.list)[names(five.list) == "percentage_gene_gc_content"] <- "Percent_GC_Content"
+```
+
+```{r merging data frames, filtering for CGIs, and statistics}
+# In order to add the CpG O/E ratios to our list, merge the five list with our data list.  
+five.cpg <- left_join(five.data, five.list, by = "Ensembl_Gene_ID")
+# filter so there are no duplicate gene descriptions
+five.cpg <- five.cpg[!duplicated(five.cpg$Gene_Description),]
+# filter so no rows without GC content
+five.cpg <- five.cpg[!is.na(five.cpg$Percent_GC_Content), ]
+# mean and SD for cpg ratio and gc content
+mean(five.cpg$CpG_Ratio)
+sd(five.cpg$CpG_Ratio)
+mean(five.cpg$GC_Content)
+sd(five.cpg$GC_Content)
+# create list with only CpG islands
+five.cpg.island <- filter(five.cpg, GC_Content > 50, CpG_Ratio > 0.6, L > 199)
+# mean and SD for cpg island ratio and gc content
+mean(five.cpg.island$CpG_Ratio)
+sd(five.cpg.island$CpG_Ratio)
+mean(five.cpg.island$GC_Content)
+sd(five.cpg.island$GC_Content)
+```
+
+```{r writing tables for Cytoscape BiNGO analysis}
+# Now we are ready use Cytoscape BiNGO to determine significance of our CpG islands. First create a reference list from all the genes. Upon creating the text file, edit the first line to this: (species=/Users/emilyspeciale/Desktop/five_cytoscape.txt)(type=Biological Process)(curator=GO)
+five.cytoscape <- getBM(attributes=c('ensembl_gene_id', 'go_id'),
+                        values = five.cpg, 
+                        mart = ensembl
+)
+five.cytoscape$go_id <- gsub("GO:","",as.character(five.cytoscape$go_id))
+five.cytoscape <- subset(five.cytoscape, five.cytoscape$go_id!="")
+write.table(five.cytoscape, file = 'five_cytoscape.txt', sep=" = ",
+            row.names = FALSE,
+            quote = FALSE)
+# Now make a table with our CpG island data that we can put into Cytoscape BiNGO and test against the reference list.
+five.cpg.cyto <- dplyr::select(five.cpg.island, Ensembl_Gene_ID)
+write.table(five.cpg.cyto, file = "five_cpg_cyto.txt", sep=" = ",
+            row.names = FALSE,
+            quote = FALSE)
+```
+
+## 3' UTR
+
+```{r importing data and calculations}
+# install and read in Biostrings
+BiocManager::install("Biostrings")
+library("Biostrings")
+# use Biostrings to read in exon IDs and sequences
+three <- readDNAStringSet("three_export.txt")
+# find frequencies of Cs, Gs, CGs, and CGs
+three.sequences <- data.frame(Ensembl_Gene_ID = names(three),Sequence = three, dinucleotideFrequency(three), oligonucleotideFrequency(three, width=1))
+three.sequences <- dplyr::select(three.sequences, Ensembl_Gene_ID, Sequence, C, G, CG, GC)
+# delete rows where sequence unavailable
+three.sequences <- subset(three.sequences, Sequence != "SNCNAVAAB")
+# delete rows where C or G is 0
+three.sequences <- subset(three.sequences, C != 0)
+three.sequences <- subset(three.sequences, G != 0)
+# find length of each sequence
+three.sequences$L <- nchar(three.sequences$Sequence)
+# add together Gs and Cs to get % gc content
+three.sequences$GC_Content <- ((three.sequences$C + three.sequences$G) / (three.sequences$L)) * 100
+# calculate CpG ratio based on this definition
+# https://bmcgenomics.biomedcentral.com/articles/10.1186/1471-2164-11-483
+three.sequences$A <- three.sequences$CG / (three.sequences$C * three.sequences$G)
+three.sequences$B <- (three.sequences$L)^2 / (three.sequences$L - 1)
+three.sequences$CpG_Ratio <- three.sequences$A * three.sequences$B
+# filter list to just gene ID and ratio
+three.data <- dplyr::select(three.sequences, Ensembl_Gene_ID, CpG_Ratio, GC_Content, L)
+```
+
+```{r creating attribute table with gene ontology descriptions }
+# Load ViSEAGO package from Bioconductor.
+BiocManager::install("ViSEAGO")
+# Install biomaRt.
+BiocManager::install("biomaRt")
+library(biomaRt)
+ensembl <- useMart("ensembl")
+# Make a biomaRt for Fundulus heteroclitus.
+ensembl <- useMart("ensembl", dataset="fheteroclitus_gene_ensembl")
+# Load in the different filters you can apply to a query.
+filters <- listFilters(ensembl)
+# Load in the different attributes you can grab from biomaRt.
+attributes <- listAttributes(ensembl)
+# Use the attributes to create a list with Gene ID, GO ID, transcript length, domain, term name, gene description, and percent GC content
+three.list <- getBM(attributes=c('ensembl_gene_id', 'go_id','transcript_length', 'namespace_1003', 'name_1006', 'description', 'percentage_gene_gc_content'),
+                    values = three.data, 
+                    mart = ensembl)
+# Delete rows with no GO ID. 
+three.list <- subset(three.list, three.list$go_id!="")
+# Rename the columns of this list. 
+names(three.list)[names(three.list) == "ensembl_gene_id"] <- "Ensembl_Gene_ID"
+names(three.list)[names(three.list) == "go_id"] <- "GO_ID"
+names(three.list)[names(three.list) == "transcript_length"] <- "Transcript_Length"
+names(three.list)[names(three.list) == "namespace_1003"] <- "GO_Domain"
+names(three.list)[names(three.list) == "name_1006"] <- "GO_Term_Name"
+names(three.list)[names(three.list) == "description"] <- "Gene_Description"
+names(three.list)[names(three.list) == "percentage_gene_gc_content"] <- "Percent_GC_Content"
+```
+
+```{r merging data frames, filtering for CGIs, and statistics}
+# In order to add the CpG O/E ratios to our list, merge the three list with our data list.  
+three.cpg <- left_join(three.data, three.list, by = "Ensembl_Gene_ID")
+# filter so there are no duplicate gene descriptions
+three.cpg <- three.cpg[!duplicated(three.cpg$Gene_Description),]
+# filter so no rows without GC content
+three.cpg <- three.cpg[!is.na(three.cpg$Percent_GC_Content), ]
+# mean and SD for cpg ratio and gc content
+mean(three.cpg$CpG_Ratio)
+sd(three.cpg$CpG_Ratio)
+mean(three.cpg$GC_Content)
+sd(three.cpg$GC_Content)
+# create list with only CpG islands
+three.cpg.island <- filter(three.cpg, GC_Content > 50, CpG_Ratio > 0.6, L > 199)
+# mean and SD for cpg island ratio and gc content
+mean(three.cpg.island$CpG_Ratio)
+sd(three.cpg.island$CpG_Ratio)
+mean(three.cpg.island$GC_Content)
+sd(three.cpg.island$GC_Content)
+```
+
+```{r writing tables for Cytoscape BiNGO analysis}
+# Now we are ready use Cytoscape BiNGO to determine significance of our CpG islands. First create a reference list from all the genes. Upon creating the text file, edit the first line to this: (species=/Users/emilyspeciale/Desktop/three_cytoscape.txt)(type=Biological Process)(curator=GO)
+three.cytoscape <- getBM(attributes=c('ensembl_gene_id', 'go_id'),
+                         values = three.cpg, 
+                         mart = ensembl
+)
+three.cytoscape$go_id <- gsub("GO:","",as.character(three.cytoscape$go_id))
+three.cytoscape <- subset(three.cytoscape, three.cytoscape$go_id!="")
+write.table(three.cytoscape, file = 'three_cytoscape.txt', sep=" = ",
+            row.names = FALSE,
+            quote = FALSE)
+# Now make a table with our CpG island data that we can put into Cytoscape BiNGO and test against the reference list.
+three.cpg.cyto <- dplyr::select(three.cpg.island, Ensembl_Gene_ID)
+write.table(three.cpg.cyto, file = "three_cpg_cyto.txt", sep=" = ",
+            row.names = FALSE,
+            quote = FALSE)
+```
+
+## Statistical Analysis
+
+```{r summaries and statistical testing}
+# make region column for all data sets
+exon.cpg <- mutate(exon.cpg, Region = "Exon")
+five.cpg <- mutate(five.cpg, Region = "FiveUTR")
+three.cpg <- mutate(three.cpg, Region = "ThreeUTR")
+exon.cpg.island <- mutate(exon.cpg.island, Region = "Exon")
+five.cpg.island <- mutate(five.cpg.island, Region = "FiveUTR")
+three.cpg.island <- mutate(three.cpg.island, Region = "ThreeUTR")
+# combine data sets
+all.cpg <- rbind(exon.cpg, five.cpg, three.cpg)
+all.cpg.island <- rbind(exon.cpg.island, five.cpg.island, three.cpg.island)
+# summary tables
+summary.cpg <- all.cpg %>% 
+  group_by(Region) %>%
+  summarize(
+    Count = n(),
+    Mean.CpG = mean(CpG_Ratio),
+    SD.CpG = sd(CpG_Ratio),
+    Mean.GC = mean(GC_Content),
+    SD.GC = sd(GC_Content)
+  )
+
+summary.cpg.island <- all.cpg.island %>% 
+  group_by(Region) %>%
+  summarize(
+    Count = n(),
+    Mean.CpG = mean(CpG_Ratio),
+    SD.CpG = sd(CpG_Ratio),
+    Mean.GC = mean(GC_Content),
+    SD.GC = sd(GC_Content)
+  )
+# Kruskal and Dunn Tests
+library(FSA)
+kruskal.test(CpG_Ratio ~ Region, data = all.cpg)
+dunnTest(CpG_Ratio ~ Region, data = all.cpg, method = "holm")
+kruskal.test(CpG_Ratio ~ Region, data = all.cpg.island)
+dunnTest(CpG_Ratio ~ Region, data = all.cpg.island, method = "holm")
+kruskal.test(GC_Content ~ Region, data = all.cpg)
+dunnTest(GC_Content ~ Region, data = all.cpg, method = "holm")
+kruskal.test(GC_Content ~ Region, data = all.cpg.island)
+dunnTest(GC_Content ~ Region, data = all.cpg.island, method = "holm")
+```
+
+```{r CGI frequency plot}
+# cpg island frequency
+library("RColorBrewer")
+Data = c("Exons", "5'UTR", "3'UTR")
+CpG.Island.Frequency = c(15.5, 22.9, 1.01)
+freq.plot <- data.frame(Data, CpG.Island.Frequency)
+freq.plot$Data <- factor(freq.plot$Data, levels = freq.plot$Data)
+p <- ggplot(data = freq.plot, aes(x = Data, y = CpG.Island.Frequency, fill = Data)) + 
+  geom_bar(stat="identity", color = "black") + 
+  scale_fill_brewer(palette = "Greens", direction = -1) +
+  theme_bw() +
+  geom_text(aes(label=CpG.Island.Frequency), vjust=-0.3, size=6) +
+  labs(x = " ", y = "CpG Island Frequency (%)")        
+p + theme(legend.position="none") + theme(axis.text = element_text(size = 13)) + theme(axis.title = element_text(size = 15)) + theme(legend.position="none")
+
+```
+
+```{r violin plots}
+library(ggplot2)
+# filtering results so CpG O/E Ratio < 1.5 and GC content < 80 for plotting purposes
+all.cpg.filter <- subset(all.cpg, CpG_Ratio < 1.5)
+all.cpg.i.filter <- subset(all.cpg.island, CpG_Ratio < 1.5)
+all.cpg.filter2 <- subset(all.cpg, GC_Content < 80)
+all.cpg.i.filter2 <- subset(all.cpg.island, GC_Content < 80)
+# violin plot for CpG O/E Ratio
+p <- ggplot(data = all.cpg.filter, aes(x = Region, y = CpG_Ratio, fill = Region)) + 
+  geom_violin() + 
+  theme(legend.position="none") +
+  scale_fill_brewer(palette="Oranges") + 
+  theme_bw() +
+  coord_flip() + 
+  scale_x_discrete(limits=rev) +
+  labs(y = "CpG O/E Ratio", x = "Genomic Region")
+p + theme(axis.text = element_text(size = 20)) + theme(axis.title = element_text(size = 20)) + theme(legend.position="none") + stat_summary(fun.data=mean_sdl, mult=1, geom="pointrange", color="black")
+
+# violin plot for CpG O/E Ratio of CGIs
+p <- ggplot(data = all.cpg.i.filter, aes(x = Region, y = CpG_Ratio, fill = Region)) + 
+  geom_violin() + 
+  theme(legend.position="none") +
+  scale_fill_brewer(palette="Oranges") + 
+  theme_bw() +
+  coord_flip() + 
+  scale_x_discrete(limits=rev) +
+  labs(y = "CpG O/E Ratio of CpG Islands", x = "Genomic Region")
+p + theme(axis.text = element_text(size = 20)) + theme(axis.title = element_text(size = 20)) + theme(legend.position="none") + stat_summary(fun.data=mean_sdl, mult=1, geom="pointrange", color="black")
+
+# violin plot for GC content
+p <- ggplot(data = all.cpg.filter2, aes(x = Region, y = GC_Content, fill = Region)) + 
+  geom_violin() + 
+  theme(legend.position="none") +
+  scale_fill_brewer(palette="Greens") + 
+  theme_bw() +
+  coord_flip() + 
+  scale_x_discrete(limits=rev) +
+  labs(y = "GC Content (%)", x = "Genomic Region")
+p + theme(axis.text = element_text(size = 20)) + theme(axis.title = element_text(size = 20)) + theme(legend.position="none") + stat_summary(fun.data=mean_sdl, mult=1, geom="pointrange", color="black")
+
+# violin plot for GC Content of CGIs
+p <- ggplot(data = all.cpg.i.filter2, aes(x = Region, y = GC_Content, fill = Region)) + 
+  geom_violin() + 
+  theme(legend.position="none") +
+  scale_fill_brewer(palette="Greens") + 
+  theme_bw() +
+  coord_flip() + 
+  scale_x_discrete(limits=rev) +
+  labs(y = "GC Content (%) of CpG Islands", x = "Genomic Region")
+p + theme(axis.text = element_text(size = 20)) + theme(axis.title = element_text(size = 20)) + theme(legend.position="none") + stat_summary(fun.data=mean_sdl, mult=1, geom="pointrange", color="black")
+```
+
